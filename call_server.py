@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import sqlite3
-import uuid
 from datetime import datetime
 import websockets
 from websockets.asyncio.server import serve
@@ -55,24 +54,24 @@ def db_conn():
 # Хранилище активных сокетов и звонков
 # ------------------------------
 clients = {}   # login -> websocket
-calls = {}     # call_id -> {'caller': ws, 'callee': ws, 'caller_login': login, 'callee_login': login}
+calls = {}     # call_id -> {'caller': ws, 'callee': ws, ...}
 
 # ------------------------------
 # HTTP обработчик (для health check)
 # ------------------------------
 async def process_request(connection, request):
     """
-    Обрабатывает HTTP-запросы. Если это GET /healthz – возвращает OK.
-    Для HEAD и других запросов возвращает ответ без тела (чтобы закрыть).
-    Для WebSocket-запросов возвращает None.
+    Обрабатывает HTTP-запросы.
+    - HEAD -> пустой ответ (для health check Render)
+    - GET /healthz -> OK
+    - Все остальные -> None (WebSocket)
     """
-    # Для HEAD (health check от Render) отвечаем без тела
     if request.method == 'HEAD':
+        # Возвращаем пустой ответ для HEAD
         return http.HTTPStatus.OK, [], b''
-    # Для GET /healthz
     if request.method == 'GET' and request.path == '/healthz':
         return http.HTTPStatus.OK, [], b'OK\n'
-    # Все остальные запросы (включая WebSocket) передаём дальше
+    # Для всех остальных (включая WebSocket) возвращаем None
     return None
 
 # ------------------------------
@@ -85,7 +84,6 @@ async def handler(websocket):
             data = json.loads(message)
             cmd = data.get('cmd')
 
-            # --- Регистрация ---
             if cmd == 'register':
                 login = data['login']
                 pwd = data['password']
@@ -99,7 +97,6 @@ async def handler(websocket):
                     await websocket.send(json.dumps({'status': 'error', 'reason': 'Логин уже существует'}))
                 conn.close()
 
-            # --- Логин ---
             elif cmd == 'login':
                 login = data['login']
                 pwd = data['password']
@@ -115,7 +112,6 @@ async def handler(websocket):
                     await websocket.send(json.dumps({'status': 'error', 'reason': 'Неверный логин или пароль'}))
                 conn.close()
 
-            # --- Поиск пользователей ---
             elif cmd == 'search_users':
                 query = data.get('query', '')
                 conn = db_conn()
@@ -125,7 +121,6 @@ async def handler(websocket):
                 await websocket.send(json.dumps({'users': users}))
                 conn.close()
 
-            # --- Создать чат ---
             elif cmd == 'create_chat':
                 chat_id = data['chat_id']
                 chat_type = data['chat_type']
@@ -144,7 +139,6 @@ async def handler(websocket):
                 conn.close()
                 await websocket.send(json.dumps({'status': 'ok'}))
 
-            # --- Получить чаты ---
             elif cmd == 'get_chats':
                 conn = db_conn()
                 c = conn.cursor()
@@ -162,7 +156,6 @@ async def handler(websocket):
                 await websocket.send(json.dumps({'type': 'chats_list', 'chats': chats}))
                 conn.close()
 
-            # --- Получить сообщения ---
             elif cmd == 'get_messages':
                 chat_id = data['chat_id']
                 conn = db_conn()
@@ -173,7 +166,6 @@ async def handler(websocket):
                 await websocket.send(json.dumps({'type': 'messages', 'messages': messages}))
                 conn.close()
 
-            # --- Отправить сообщение ---
             elif cmd == 'send_message':
                 chat_id = data['chat_id']
                 sender = login
@@ -184,7 +176,6 @@ async def handler(websocket):
                 c.execute("INSERT INTO messages (chat_id, sender, text, timestamp, file_data) VALUES (?,?,?,?,?)",
                           (chat_id, sender, text, datetime.now().isoformat(), file_data))
                 conn.commit()
-                # Получить всех участников чата
                 c.execute("SELECT login FROM chat_members WHERE chat_id=?", (chat_id,))
                 members = [row[0] for row in c.fetchall()]
                 conn.close()
@@ -199,7 +190,6 @@ async def handler(websocket):
                         }))
                 await websocket.send(json.dumps({'status': 'ok'}))
 
-            # --- Загрузить аватар ---
             elif cmd == 'upload_avatar':
                 avatar_b64 = data['avatar']
                 conn = db_conn()
@@ -209,7 +199,6 @@ async def handler(websocket):
                 conn.close()
                 await websocket.send(json.dumps({'status': 'ok'}))
 
-            # --- Получить аватар ---
             elif cmd == 'get_avatar':
                 target = data['login']
                 conn = db_conn()
@@ -220,7 +209,6 @@ async def handler(websocket):
                 await websocket.send(json.dumps({'avatar': avatar}))
                 conn.close()
 
-            # --- Инициировать звонок ---
             elif cmd == 'call_start':
                 call_id = data['call_id']
                 target = data['target']
@@ -241,7 +229,6 @@ async def handler(websocket):
                 }))
                 await websocket.send(json.dumps({'status': 'ok'}))
 
-            # --- Принять звонок ---
             elif cmd == 'call_accept':
                 call_id = data['call_id']
                 if call_id in calls:
@@ -252,7 +239,6 @@ async def handler(websocket):
                     else:
                         await websocket.send(json.dumps({'status': 'error', 'reason': 'Not callee'}))
 
-            # --- Отклонить звонок ---
             elif cmd == 'call_reject':
                 call_id = data['call_id']
                 if call_id in calls:
@@ -264,7 +250,6 @@ async def handler(websocket):
                     else:
                         await websocket.send(json.dumps({'status': 'error', 'reason': 'Not callee'}))
 
-            # --- Завершить звонок ---
             elif cmd == 'call_end':
                 call_id = data['call_id']
                 if call_id in calls:
@@ -275,7 +260,6 @@ async def handler(websocket):
                     del calls[call_id]
                     await websocket.send(json.dumps({'status': 'ok'}))
 
-            # --- WebRTC сигнал ---
             elif cmd == 'webrtc_signal':
                 call_id = data['call_id']
                 signal = data['signal']
@@ -290,7 +274,6 @@ async def handler(websocket):
                         }))
                     await websocket.send(json.dumps({'status': 'ok'}))
 
-            # --- Выход ---
             elif cmd == 'logout':
                 if login:
                     conn = db_conn()
@@ -308,7 +291,6 @@ async def handler(websocket):
     finally:
         if login and login in clients:
             del clients[login]
-        # Удалить звонки с участием этого клиента
         to_delete = [cid for cid, call in calls.items() if websocket in (call['caller'], call['callee'])]
         for cid in to_delete:
             del calls[cid]
@@ -321,7 +303,7 @@ async def main():
     host = '0.0.0.0'
     async with serve(handler, host, port, process_request=process_request):
         print(f"Server running on {host}:{port}")
-        await asyncio.Future()  # бесконечно
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
