@@ -124,8 +124,14 @@ async def handler(websocket):
 
 
 async def health_check(request):
-    """Обработчик HTTP-запросов для health check."""
-    if request.path == '/healthz':
+    """
+    Обработчик HTTP-запросов для health check.
+    Поддерживает GET и HEAD на пути /healthz.
+    """
+    if request.method == 'HEAD':
+        # Для HEAD-запросов возвращаем статус без тела
+        return http.HTTPStatus.OK, [], b''
+    if request.path == '/healthz' and request.method == 'GET':
         return http.HTTPStatus.OK, [], b'OK\n'
     return None
 
