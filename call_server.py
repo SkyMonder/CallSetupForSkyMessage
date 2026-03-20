@@ -1,205 +1,154 @@
-"""
-Call Server for SkyMessage - сигнальный сервер для WebRTC звонков.
-Поддерживает масштабирование через Redis (если установлен redis).
-Развертывается на Render.
-"""
-
-import os
+#!/usr/bin/env python
+import asyncio
+import http
 import json
-import redis
-from flask import Flask, request
-from flask_socketio import SocketIO, emit, join_room, leave_room
+import os
+import signal
+import uuid
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key')
-
-# Используем Redis если настроен, иначе работаем в одном процессе
-redis_url = os.environ.get('REDIS_URL')
-if redis_url:
-    # Настройка для масштабирования
-    redis_client = redis.from_url(redis_url)
-    socketio = SocketIO(app, cors_allowed_origins="*", message_queue=redis_url)
-else:
-    socketio = SocketIO(app, cors_allowed_origins="*")
-
-# Хранилище активных пользователей: login -> sid (будет синхронизироваться через Redis)
-# Для простоты используем словарь в памяти, но при нескольких инстансах нужно общее хранилище.
-# Если Redis есть, будем хранить в Redis.
-user_sids = {}  # локальный кэш, но при масштабировании нужно использовать Redis.
-
-def get_user_sid(login):
-    if redis_url:
-        return redis_client.get(f"user:{login}")
-    else:
-        return user_sids.get(login)
-
-def set_user_sid(login, sid):
-    if redis_url:
-        redis_client.setex(f"user:{login}", 3600, sid)  # храним час
-    else:
-        user_sids[login] = sid
-
-def delete_user_sid(login):
-    if redis_url:
-        redis_client.delete(f"user:{login}")
-    else:
-        if login in user_sids:
-            del user_sids[login]
+import websockets
+from websockets.asyncio.server import serve
 
 # Хранилище активных звонков
-calls = {}  # call_id -> info
-# Если используем Redis, можно хранить и calls в Redis, но для простоты оставим в памяти.
-# Для масштабирования нужно будет также синхронизировать calls. Но так как сигнальный сервер обычно stateless,
-# можно хранить состояние звонков в Redis. Для примера реализуем базовый вариант.
+calls = {}  # call_id -> {'caller': websocket, 'callee': websocket, ...}
+user_sockets = {}  # login -> websocket
 
-@app.route('/health')
-def health():
-    return "OK", 200
 
-@socketio.on('connect')
-def handle_connect():
-    print(f"Client connected: {request.sid}")
+async def error(websocket, message):
+    await websocket.send(json.dumps({'type': 'error', 'message': message}))
 
-@socketio.on('register')
-def handle_register(data):
-    login = data.get('login')
-    if login:
-        set_user_sid(login, request.sid)
-        # Присоединяем к комнате по логину для удобства
-        join_room(login)
-        print(f"User {login} registered with sid {request.sid}")
-        emit('registered', {'status': 'ok'})
-    else:
-        emit('error', {'message': 'No login provided'})
 
-@socketio.on('disconnect')
-def handle_disconnect():
-    # Удаляем пользователя из хранилища
-    # Находим логин по sid (это неэффективно, но для простоты)
-    login_to_remove = None
-    if redis_url:
-        # Сканируем ключи user:* (не рекомендуется, но для демо)
-        for key in redis_client.scan_iter("user:*"):
-            if redis_client.get(key) == request.sid.encode():
-                login_to_remove = key.decode().split(':')[1]
-                break
-    else:
-        for login, sid in list(user_sids.items()):
-            if sid == request.sid:
-                login_to_remove = login
-                break
-    if login_to_remove:
-        delete_user_sid(login_to_remove)
-        leave_room(login_to_remove)
-        print(f"User {login_to_remove} disconnected")
-    # Также очищаем звонки, где участвовал этот sid
-    for call_id, call in list(calls.items()):
-        if call.get('caller') == request.sid or call.get('callee') == request.sid:
-            # Уведомить другого участника
-            other = call['callee'] if call['caller'] == request.sid else call['caller']
-            if other:
-                socketio.emit('call_ended', {'call_id': call_id}, room=other)
-            del calls[call_id]
+async def handler(websocket):
+    login = None
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            cmd = data.get('cmd')
 
-@socketio.on('call_start')
-def handle_call_start(data):
-    call_id = data['call_id']
-    target_login = data['target_user']
-    caller_name = data.get('caller_name', '')
-    caller_sid = request.sid
+            if cmd == 'register':
+                login = data['login']
+                user_sockets[login] = websocket
+                await websocket.send(json.dumps({'type': 'registered', 'status': 'ok'}))
+                print(f"User {login} registered")
 
-    # Найти SID получателя
-    callee_sid = get_user_sid(target_login)
-    if not callee_sid:
-        emit('call_error', {'reason': f'User {target_login} is offline'})
-        return
+            elif cmd == 'call_start':
+                call_id = data['call_id']
+                target = data['target']
+                caller_name = data.get('caller_name', login)
 
-    # Сохраняем информацию о звонке
-    calls[call_id] = {
-        'caller': caller_sid,
-        'callee': callee_sid,
-        'caller_name': caller_name,
-        'status': 'ringing'
-    }
-    # Отправляем уведомление о входящем звонке
-    socketio.emit('incoming_call', {
-        'call_id': call_id,
-        'caller_name': caller_name,
-        'from_sid': caller_sid
-    }, room=callee_sid)
+                if target not in user_sockets:
+                    await error(websocket, f'User {target} is offline')
+                    continue
 
-@socketio.on('call_accept')
-def handle_call_accept(data):
-    call_id = data['call_id']
-    call = calls.get(call_id)
-    if not call:
-        emit('call_error', {'reason': 'Call not found'})
-        return
-    if call['callee'] != request.sid:
-        emit('call_error', {'reason': 'Not your call'})
-        return
-    call['status'] = 'active'
-    # Уведомляем вызывающего
-    socketio.emit('call_accepted', {'call_id': call_id}, room=call['caller'])
+                callee_socket = user_sockets[target]
+                calls[call_id] = {
+                    'caller': websocket,
+                    'callee': callee_socket,
+                    'caller_login': login,
+                    'callee_login': target,
+                    'caller_name': caller_name,
+                }
 
-@socketio.on('call_reject')
-def handle_call_reject(data):
-    call_id = data['call_id']
-    call = calls.get(call_id)
-    if call and call['callee'] == request.sid:
-        # Уведомляем вызывающего
-        socketio.emit('call_rejected', {'call_id': call_id}, room=call['caller'])
-        del calls[call_id]
+                # Отправляем входящий звонок
+                await callee_socket.send(json.dumps({
+                    'type': 'incoming_call',
+                    'call_id': call_id,
+                    'caller_name': caller_name,
+                    'from': login,
+                }))
 
-@socketio.on('call_hangup')
-def handle_call_hangup(data):
-    call_id = data['call_id']
-    call = calls.get(call_id)
-    if call:
-        # Уведомляем другого участника
-        other = call['callee'] if call['caller'] == request.sid else call['caller']
-        if other:
-            socketio.emit('call_ended', {'call_id': call_id}, room=other)
-        del calls[call_id]
+            elif cmd == 'call_accept':
+                call_id = data['call_id']
+                call = calls.get(call_id)
+                if call and call['callee'] == websocket:
+                    # Уведомляем вызывающего
+                    await call['caller'].send(json.dumps({
+                        'type': 'call_accepted',
+                        'call_id': call_id,
+                    }))
 
-# Передача WebRTC сигналов (offer, answer, ice-candidate)
-@socketio.on('webrtc_offer')
-def handle_webrtc_offer(data):
-    call_id = data['call_id']
-    offer = data['offer']
-    call = calls.get(call_id)
-    if call and call['caller'] == request.sid:
-        # Пересылаем offer получателю
-        socketio.emit('webrtc_offer', {
-            'call_id': call_id,
-            'offer': offer
-        }, room=call['callee'])
+            elif cmd == 'call_reject':
+                call_id = data['call_id']
+                call = calls.get(call_id)
+                if call and call['callee'] == websocket:
+                    await call['caller'].send(json.dumps({
+                        'type': 'call_rejected',
+                        'call_id': call_id,
+                    }))
+                    del calls[call_id]
 
-@socketio.on('webrtc_answer')
-def handle_webrtc_answer(data):
-    call_id = data['call_id']
-    answer = data['answer']
-    call = calls.get(call_id)
-    if call and call['callee'] == request.sid:
-        socketio.emit('webrtc_answer', {
-            'call_id': call_id,
-            'answer': answer
-        }, room=call['caller'])
+            elif cmd == 'call_end':
+                call_id = data['call_id']
+                call = calls.get(call_id)
+                if call:
+                    # Уведомляем обоих участников
+                    for sock in (call['caller'], call['callee']):
+                        if sock:
+                            await sock.send(json.dumps({
+                                'type': 'call_ended',
+                                'call_id': call_id,
+                            }))
+                    del calls[call_id]
 
-@socketio.on('webrtc_ice')
-def handle_webrtc_ice(data):
-    call_id = data['call_id']
-    candidate = data['candidate']
-    call = calls.get(call_id)
-    if call:
-        # Отправить другому участнику
-        other = call['callee'] if call['caller'] == request.sid else call['caller']
-        if other:
-            socketio.emit('webrtc_ice', {
-                'call_id': call_id,
-                'candidate': candidate
-            }, room=other)
+            elif cmd == 'webrtc_signal':
+                # Пересылаем offer/answer/ice другому участнику
+                call_id = data['call_id']
+                signal_data = data['signal']  # {'type': 'offer', 'sdp': ...}
+                call = calls.get(call_id)
+                if call:
+                    # Отправляем сигнал тому, кому он адресован
+                    target_sock = call['callee'] if call['caller'] == websocket else call['caller']
+                    if target_sock:
+                        await target_sock.send(json.dumps({
+                            'type': 'webrtc_signal',
+                            'call_id': call_id,
+                            'signal': signal_data,
+                        }))
+
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        # Очистка при отключении
+        if login and login in user_sockets:
+            del user_sockets[login]
+        # Закрываем все звонки, где участвовал этот клиент
+        for cid, call in list(calls.items()):
+            if websocket in (call['caller'], call['callee']):
+                other = call['callee'] if call['caller'] == websocket else call['caller']
+                if other:
+                    try:
+                        await other.send(json.dumps({'type': 'call_ended', 'call_id': cid}))
+                    except:
+                        pass
+                del calls[cid]
+
+
+async def health_check(request):
+    """Обработчик HTTP-запросов для health check."""
+    if request.path == '/healthz':
+        return http.HTTPStatus.OK, [], b'OK\n'
+    return None
+
+
+async def main():
+    port = int(os.environ.get('PORT', '8000'))
+    host = '0.0.0.0'
+
+    async with serve(
+        handler,
+        host,
+        port,
+        process_request=health_check,
+    ):
+        print(f'Server started on {host}:{port}')
+
+        # Ожидаем сигнал завершения
+        loop = asyncio.get_running_loop()
+        stop = loop.create_future()
+        loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
+
+        await stop
+
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+    asyncio.run(main())
