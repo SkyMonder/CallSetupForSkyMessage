@@ -1,5 +1,4 @@
-websocket
-flask
-flask-socketio
-flask-cors
-eventlet
+flask 
+flask-socketio 
+pillow 
+requests
