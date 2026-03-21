@@ -50,7 +50,7 @@ def register():
     users[login] = {
         'password': password,
         'avatar': avatar,
-        'contacts': []  # логины, с которыми были сообщения
+        'contacts': []
     }
     save_json(USERS_FILE, users)
     
@@ -102,21 +102,27 @@ def update_profile():
     save_json(PROFILES_FILE, profiles)
     return jsonify({'success': True})
 
-# ---------------------------------- Поиск и контакты ----------------------------------
+# ---------------------------------- Контакты ----------------------------------
+@app.route('/contacts/<login>')
+def get_contacts(login):
+    users = load_json(USERS_FILE)
+    if login not in users:
+        return jsonify([])
+    return jsonify(users[login].get('contacts', []))
+
+def add_contact(user, other):
+    users = load_json(USERS_FILE)
+    if user in users and other not in users[user].get('contacts', []):
+        users[user].setdefault('contacts', []).append(other)
+        save_json(USERS_FILE, users)
+
+# ---------------------------------- Поиск пользователей ----------------------------------
 @app.route('/search_users')
 def search_users():
     query = request.args.get('q', '')
     users = load_json(USERS_FILE)
     result = [{'login': u} for u in users if query.lower() in u.lower()]
     return jsonify(result)
-
-@app.route('/contacts/<login>')
-def get_contacts(login):
-    users = load_json(USERS_FILE)
-    if login not in users:
-        return jsonify([])
-    contacts = users[login].get('contacts', [])
-    return jsonify(contacts)
 
 # ---------------------------------- Сообщения ----------------------------------
 def save_message(chat_id, msg):
@@ -126,34 +132,28 @@ def save_message(chat_id, msg):
     messages[chat_id].append(msg)
     save_json(MESSAGES_FILE, messages)
 
-def add_contact_if_needed(user, other):
-    users = load_json(USERS_FILE)
-    if user in users and other not in users[user].get('contacts', []):
-        users[user].setdefault('contacts', []).append(other)
-        save_json(USERS_FILE, users)
-
 @socketio.on('private_message')
 def handle_private_message(data):
-    to_user = data['to']
     from_user = data['from']
+    to_user = data['to']
     msg = {
         'id': str(uuid.uuid4()),
         'from': from_user,
-        'text': data['text'],
+        'text': data.get('text', ''),
         'timestamp': datetime.now().isoformat(),
         'type': 'private',
-        'file': data.get('file'),  # base64 или None
+        'file': data.get('file'),
         'file_name': data.get('file_name'),
-        'voice': data.get('voice')  # для голосовых
+        'voice': data.get('voice')
     }
     chat_id = f"private_{from_user}_{to_user}" if from_user < to_user else f"private_{to_user}_{from_user}"
     save_message(chat_id, msg)
-    # Добавляем в контакты обоим
-    add_contact_if_needed(from_user, to_user)
-    add_contact_if_needed(to_user, from_user)
-    # Отправляем получателю и отправителю
-    emit('new_message', msg, room=to_user)
+    # Добавляем в контакты
+    add_contact(from_user, to_user)
+    add_contact(to_user, from_user)
+    # Отправляем обоим
     emit('new_message', msg, room=from_user)
+    emit('new_message', msg, room=to_user)
 
 @socketio.on('group_message')
 def handle_group_message(data):
@@ -162,13 +162,12 @@ def handle_group_message(data):
     msg = {
         'id': str(uuid.uuid4()),
         'from': from_user,
-        'text': data['text'],
+        'text': data.get('text', ''),
         'timestamp': datetime.now().isoformat(),
         'type': 'group',
         'group_id': group_id,
         'file': data.get('file'),
-        'file_name': data.get('file_name'),
-        'voice': data.get('voice')
+        'file_name': data.get('file_name')
     }
     save_message(group_id, msg)
     groups = load_json(GROUPS_FILE)
@@ -183,7 +182,7 @@ def handle_channel_message(data):
     msg = {
         'id': str(uuid.uuid4()),
         'from': from_user,
-        'text': data['text'],
+        'text': data.get('text', ''),
         'timestamp': datetime.now().isoformat(),
         'type': 'channel',
         'channel_id': channel_id,
