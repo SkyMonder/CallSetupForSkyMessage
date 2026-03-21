@@ -5,11 +5,7 @@ import sqlite3
 from datetime import datetime
 import websockets
 from websockets.asyncio.server import serve
-import http
 
-# ------------------------------
-# База данных
-# ------------------------------
 DB_PATH = 'skymessage.db'
 
 def init_db():
@@ -50,33 +46,9 @@ init_db()
 def db_conn():
     return sqlite3.connect(DB_PATH)
 
-# ------------------------------
-# Хранилище активных сокетов и звонков
-# ------------------------------
-clients = {}   # login -> websocket
-calls = {}     # call_id -> {'caller': ws, 'callee': ws, ...}
+clients = {}
+calls = {}
 
-# ------------------------------
-# HTTP обработчик (для health check)
-# ------------------------------
-async def process_request(connection, request):
-    """
-    Обрабатывает HTTP-запросы.
-    - HEAD -> пустой ответ (для health check Render)
-    - GET /healthz -> OK
-    - Все остальные -> None (WebSocket)
-    """
-    if request.method == 'HEAD':
-        # Возвращаем пустой ответ для HEAD
-        return http.HTTPStatus.OK, [], b''
-    if request.method == 'GET' and request.path == '/healthz':
-        return http.HTTPStatus.OK, [], b'OK\n'
-    # Для всех остальных (включая WebSocket) возвращаем None
-    return None
-
-# ------------------------------
-# WebSocket обработчик
-# ------------------------------
 async def handler(websocket):
     login = None
     try:
@@ -295,13 +267,10 @@ async def handler(websocket):
         for cid in to_delete:
             del calls[cid]
 
-# ------------------------------
-# Запуск
-# ------------------------------
 async def main():
     port = int(os.environ.get('PORT', '8000'))
     host = '0.0.0.0'
-    async with serve(handler, host, port, process_request=process_request):
+    async with serve(handler, host, port):
         print(f"Server running on {host}:{port}")
         await asyncio.Future()
 
