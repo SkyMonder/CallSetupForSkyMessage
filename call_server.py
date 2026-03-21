@@ -303,4 +303,5 @@ def handle_call_end(data):
         emit('call_ended', {'call_id': call_id}, room=calls[call_id]['to'])
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    # Для production на Render добавляем allow_unsafe_werkzeug=True
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
