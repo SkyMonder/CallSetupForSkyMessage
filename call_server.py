@@ -1,322 +1,306 @@
-from flask import Flask, request
-from flask_socketio import SocketIO, emit
-import sqlite3
+# server.py
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import json
 import os
+import base64
 from datetime import datetime
-import uuid
+import threading
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+app.config['SECRET_KEY'] = 'skymessage_secret'
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-DB_PATH = 'skymessage.db'
+DATA_DIR = 'server_data'
+USERS_FILE = os.path.join(DATA_DIR, 'users.json')
+GROUPS_FILE = os.path.join(DATA_DIR, 'groups.json')
+CHANNELS_FILE = os.path.join(DATA_DIR, 'channels.json')
+MESSAGES_FILE = os.path.join(DATA_DIR, 'messages.json')
+CALLS_FILE = os.path.join(DATA_DIR, 'calls.json')
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        login TEXT PRIMARY KEY,
-        password TEXT,
-        avatar TEXT,
-        online INTEGER DEFAULT 0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS chats (
-        chat_id TEXT PRIMARY KEY,
-        chat_type TEXT,
-        name TEXT,
-        created_by TEXT,
-        created_at TEXT
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS chat_members (
-        chat_id TEXT,
-        login TEXT,
-        role TEXT,
-        PRIMARY KEY (chat_id, login)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT,
-        sender TEXT,
-        text TEXT,
-        timestamp TEXT,
-        file_data TEXT
-    )''')
-    conn.commit()
-    conn.close()
+# Создаём папку и файлы если их нет
+def init_data():
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+    for file in [USERS_FILE, GROUPS_FILE, CHANNELS_FILE, MESSAGES_FILE, CALLS_FILE]:
+        if not os.path.exists(file):
+            with open(file, 'w', encoding='utf-8') as f:
+                json.dump({}, f)
 
-init_db()
+init_data()
 
-def db_conn():
-    return sqlite3.connect(DB_PATH)
+def load_json(file):
+    with open(file, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-clients = {}
-calls = {}
+def save_json(file, data):
+    with open(file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def send_response(sid, data, callback_id=None):
-    if callback_id:
-        data['callback_id'] = callback_id
-    socketio.emit('registered' if data.get('status') == 'ok' and 'login' not in data else 
-                  'logged_in' if data.get('status') == 'ok' and 'login' in data else
-                  'search_result' if 'users' in data else
-                  'chat_created' if data.get('status') == 'ok' and 'chat_id' in data else
-                  'avatar_uploaded' if data.get('status') == 'ok' and 'avatar' in data else
-                  'avatar_data' if 'avatar' in data else
-                  'error', data, room=sid)
+# ---------------------------------- Аутентификация ----------------------------------
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.json
+    login = data.get('login')
+    password = data.get('password')
+    avatar = data.get('avatar')  # base64 строка
 
-@socketio.on('register')
-def handle_register(data):
-    callback_id = data.get('callback_id')
-    login = data['login']
-    password = data['password']
-    conn = db_conn()
-    c = conn.cursor()
-    try:
-        c.execute("INSERT INTO users (login, password) VALUES (?, ?)", (login, password))
-        conn.commit()
-        send_response(request.sid, {'status': 'ok'}, callback_id)
-    except sqlite3.IntegrityError:
-        send_response(request.sid, {'status': 'error', 'reason': 'Логин уже существует'}, callback_id)
-    conn.close()
-
-@socketio.on('login')
-def handle_login(data):
-    callback_id = data.get('callback_id')
-    login = data['login']
-    password = data['password']
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE login=? AND password=?", (login, password))
-    if c.fetchone():
-        c.execute("UPDATE users SET online=1 WHERE login=?", (login,))
-        conn.commit()
-        clients[login] = request.sid
-        send_response(request.sid, {'status': 'ok', 'login': login}, callback_id)
-    else:
-        send_response(request.sid, {'status': 'error', 'reason': 'Неверный логин или пароль'}, callback_id)
-    conn.close()
-
-@socketio.on('search_users')
-def handle_search_users(data):
-    callback_id = data.get('callback_id')
-    query = data.get('query', '')
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("SELECT login FROM users WHERE login LIKE ?", ('%'+query+'%',))
-    users = [row[0] for row in c.fetchall()]
-    send_response(request.sid, {'users': users}, callback_id)
-    conn.close()
-
-@socketio.on('create_chat')
-def handle_create_chat(data):
-    callback_id = data.get('callback_id')
-    chat_id = data['chat_id']
-    chat_type = data['chat_type']
-    name = data.get('name', '')
-    created_by = data['created_by']
-    members = data['members']
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO chats (chat_id, chat_type, name, created_by, created_at) VALUES (?,?,?,?,?)",
-              (chat_id, chat_type, name, created_by, datetime.now().isoformat()))
-    for m in members:
-        role = 'owner' if m == created_by else 'member'
-        c.execute("INSERT INTO chat_members (chat_id, login, role) VALUES (?,?,?)",
-                  (chat_id, m, role))
-    conn.commit()
-    conn.close()
-    send_response(request.sid, {'status': 'ok', 'chat_id': chat_id}, callback_id)
-
-@socketio.on('get_chats')
-def handle_get_chats(data):
-    login = None
-    for l, sid in clients.items():
-        if sid == request.sid:
-            login = l
-            break
-    if not login:
-        return
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("SELECT chat_id, chat_type, name FROM chats WHERE chat_id IN (SELECT chat_id FROM chat_members WHERE login=?)",
-              (login,))
-    rows = c.fetchall()
-    chats = []
-    for chat_id, chat_type, name in rows:
-        if chat_type == 'private':
-            c2 = conn.cursor()
-            c2.execute("SELECT login FROM chat_members WHERE chat_id=? AND login!=?", (chat_id, login))
-            other = c2.fetchone()
-            name = other[0] if other else chat_id
-        chats.append({'chat_id': chat_id, 'type': chat_type, 'name': name})
-    socketio.emit('chats_list', chats, room=request.sid)
-    conn.close()
-
-@socketio.on('get_messages')
-def handle_get_messages(data):
-    chat_id = data['chat_id']
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("SELECT sender, text, timestamp, file_data FROM messages WHERE chat_id=? ORDER BY id", (chat_id,))
-    rows = c.fetchall()
-    messages = [{'sender': r[0], 'text': r[1], 'timestamp': r[2], 'file': r[3]} for r in rows]
-    socketio.emit('messages', messages, room=request.sid)
-    conn.close()
-
-@socketio.on('send_message')
-def handle_send_message(data):
-    login = None
-    for l, sid in clients.items():
-        if sid == request.sid:
-            login = l
-            break
-    if not login:
-        return
-    chat_id = data['chat_id']
-    text = data.get('text', '')
-    file_data = data.get('file_data')
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO messages (chat_id, sender, text, timestamp, file_data) VALUES (?,?,?,?,?)",
-              (chat_id, login, text, datetime.now().isoformat(), file_data))
-    conn.commit()
-    c.execute("SELECT login FROM chat_members WHERE chat_id=?", (chat_id,))
-    members = [row[0] for row in c.fetchall()]
-    conn.close()
-    for m in members:
-        if m in clients:
-            socketio.emit('new_message', {
-                'chat_id': chat_id,
-                'sender': login,
-                'text': text,
-                'file': file_data
-            }, room=clients[m])
-    socketio.emit('message_sent', {'status': 'ok'}, room=request.sid)
-
-@socketio.on('upload_avatar')
-def handle_upload_avatar(data):
-    callback_id = data.get('callback_id')
-    login = None
-    for l, sid in clients.items():
-        if sid == request.sid:
-            login = l
-            break
-    if not login:
-        return
-    avatar_b64 = data['avatar']
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("UPDATE users SET avatar=? WHERE login=?", (avatar_b64, login))
-    conn.commit()
-    conn.close()
-    send_response(request.sid, {'status': 'ok'}, callback_id)
-
-@socketio.on('get_avatar')
-def handle_get_avatar(data):
-    callback_id = data.get('callback_id')
-    target = data['login']
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("SELECT avatar FROM users WHERE login=?", (target,))
-    row = c.fetchone()
-    avatar = row[0] if row else None
-    send_response(request.sid, {'avatar': avatar}, callback_id)
-    conn.close()
-
-@socketio.on('call_start')
-def handle_call_start(data):
-    call_id = data['call_id']
-    target = data['target']
-    if target not in clients:
-        send_response(request.sid, {'status': 'error', 'reason': 'User offline'})
-        return
-    calls[call_id] = {
-        'caller': request.sid,
-        'callee': clients[target],
-        'caller_login': None,  # можно получить по sid
-        'callee_login': target,
+    users = load_json(USERS_FILE)
+    if login in users:
+        return jsonify({'success': False, 'error': 'Логин уже существует'}), 400
+    users[login] = {
+        'password': password,
+        'avatar': avatar,
+        'contacts': [],
+        'groups': [],
+        'channels': []
     }
-    socketio.emit('incoming_call', {
-        'call_id': call_id,
-        'caller_name': next((l for l, sid in clients.items() if sid == request.sid), ''),
-        'from': next((l for l, sid in clients.items() if sid == request.sid), '')
-    }, room=clients[target])
-    send_response(request.sid, {'status': 'ok'})
+    save_json(USERS_FILE, users)
+    return jsonify({'success': True})
 
-@socketio.on('call_accept')
-def handle_call_accept(data):
-    call_id = data['call_id']
-    if call_id in calls:
-        call = calls[call_id]
-        if call['callee'] == request.sid:
-            socketio.emit('call_accepted', {'call_id': call_id}, room=call['caller'])
-            send_response(request.sid, {'status': 'ok'})
-        else:
-            send_response(request.sid, {'status': 'error', 'reason': 'Not callee'})
-    else:
-        send_response(request.sid, {'status': 'error', 'reason': 'Call not found'})
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    login = data.get('login')
+    password = data.get('password')
+    users = load_json(USERS_FILE)
+    if login not in users or users[login]['password'] != password:
+        return jsonify({'success': False, 'error': 'Неверный логин или пароль'}), 401
+    return jsonify({'success': True, 'avatar': users[login].get('avatar')})
 
-@socketio.on('call_reject')
-def handle_call_reject(data):
+# ---------------------------------- Получение данных ----------------------------------
+@app.route('/users/<login>')
+def get_user(login):
+    users = load_json(USERS_FILE)
+    if login not in users:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify({
+        'login': login,
+        'avatar': users[login].get('avatar')
+    })
+
+@app.route('/search_users')
+def search_users():
+    query = request.args.get('q', '')
+    users = load_json(USERS_FILE)
+    result = [{'login': u, 'avatar': users[u].get('avatar')} for u in users if query.lower() in u.lower()]
+    return jsonify(result)
+
+@app.route('/groups')
+def get_groups():
+    groups = load_json(GROUPS_FILE)
+    return jsonify(groups)
+
+@app.route('/channels')
+def get_channels():
+    channels = load_json(CHANNELS_FILE)
+    return jsonify(channels)
+
+# ---------------------------------- Сокетные события ----------------------------------
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('join')
+def handle_join(data):
+    user = data['user']
+    join_room(user)
+    emit('joined', {'user': user}, room=user)
+
+@socketio.on('private_message')
+def handle_private_message(data):
+    to_user = data['to']
+    msg = {
+        'from': data['from'],
+        'text': data['text'],
+        'timestamp': datetime.now().isoformat(),
+        'type': 'private'
+    }
+    # Сохраняем сообщение
+    messages = load_json(MESSAGES_FILE)
+    chat_id = f"private_{data['from']}_{to_user}" if data['from'] < to_user else f"private_{to_user}_{data['from']}"
+    if chat_id not in messages:
+        messages[chat_id] = []
+    messages[chat_id].append(msg)
+    save_json(MESSAGES_FILE, messages)
+    # Отправляем получателю
+    emit('new_message', msg, room=to_user)
+    # Отправителю для отображения
+    emit('new_message', msg, room=data['from'])
+
+@socketio.on('group_message')
+def handle_group_message(data):
+    group_id = data['group_id']
+    msg = {
+        'from': data['from'],
+        'text': data['text'],
+        'timestamp': datetime.now().isoformat(),
+        'type': 'group',
+        'group_id': group_id
+    }
+    # Сохраняем
+    messages = load_json(MESSAGES_FILE)
+    if group_id not in messages:
+        messages[group_id] = []
+    messages[group_id].append(msg)
+    save_json(MESSAGES_FILE, messages)
+    # Отправляем всем участникам группы
+    groups = load_json(GROUPS_FILE)
+    if group_id in groups:
+        for member in groups[group_id]['members']:
+            emit('new_message', msg, room=member)
+
+@socketio.on('channel_message')
+def handle_channel_message(data):
+    channel_id = data['channel_id']
+    msg = {
+        'from': data['from'],
+        'text': data['text'],
+        'timestamp': datetime.now().isoformat(),
+        'type': 'channel',
+        'channel_id': channel_id
+    }
+    messages = load_json(MESSAGES_FILE)
+    if channel_id not in messages:
+        messages[channel_id] = []
+    messages[channel_id].append(msg)
+    save_json(MESSAGES_FILE, messages)
+    # Отправляем всем подписчикам канала
+    channels = load_json(CHANNELS_FILE)
+    if channel_id in channels:
+        for member in channels[channel_id]['subscribers']:
+            emit('new_message', msg, room=member)
+
+@socketio.on('create_group')
+def handle_create_group(data):
+    group_name = data['name']
+    creator = data['creator']
+    members = data.get('members', [])
+    members.append(creator)  # создатель тоже участник
+    groups = load_json(GROUPS_FILE)
+    group_id = f"group_{len(groups)+1}_{group_name}"
+    groups[group_id] = {
+        'name': group_name,
+        'creator': creator,
+        'members': list(set(members)),
+        'avatar': data.get('avatar')
+    }
+    save_json(GROUPS_FILE, groups)
+    # Обновляем у пользователей список групп
+    users = load_json(USERS_FILE)
+    for member in groups[group_id]['members']:
+        if member in users:
+            if group_id not in users[member].get('groups', []):
+                users[member].setdefault('groups', []).append(group_id)
+    save_json(USERS_FILE, users)
+    emit('group_created', {'group_id': group_id, 'group': groups[group_id]}, broadcast=True)
+
+@socketio.on('create_channel')
+def handle_create_channel(data):
+    channel_name = data['name']
+    creator = data['creator']
+    channels = load_json(CHANNELS_FILE)
+    channel_id = f"channel_{len(channels)+1}_{channel_name}"
+    channels[channel_id] = {
+        'name': channel_name,
+        'creator': creator,
+        'subscribers': [creator],
+        'avatar': data.get('avatar')
+    }
+    save_json(CHANNELS_FILE, channels)
+    users = load_json(USERS_FILE)
+    if creator in users:
+        users[creator].setdefault('channels', []).append(channel_id)
+    save_json(USERS_FILE, users)
+    emit('channel_created', {'channel_id': channel_id, 'channel': channels[channel_id]}, broadcast=True)
+
+@socketio.on('join_channel')
+def handle_join_channel(data):
+    user = data['user']
+    channel_id = data['channel_id']
+    channels = load_json(CHANNELS_FILE)
+    if channel_id in channels and user not in channels[channel_id]['subscribers']:
+        channels[channel_id]['subscribers'].append(user)
+        save_json(CHANNELS_FILE, channels)
+        users = load_json(USERS_FILE)
+        users[user].setdefault('channels', []).append(channel_id)
+        save_json(USERS_FILE, users)
+        emit('channel_updated', {'channel_id': channel_id, 'subscribers': channels[channel_id]['subscribers']}, broadcast=True)
+
+@socketio.on('add_group_member')
+def handle_add_group_member(data):
+    group_id = data['group_id']
+    new_member = data['member']
+    groups = load_json(GROUPS_FILE)
+    if group_id in groups and new_member not in groups[group_id]['members']:
+        groups[group_id]['members'].append(new_member)
+        save_json(GROUPS_FILE, groups)
+        users = load_json(USERS_FILE)
+        if new_member in users:
+            users[new_member].setdefault('groups', []).append(group_id)
+        save_json(USERS_FILE, users)
+        emit('group_updated', {'group_id': group_id, 'members': groups[group_id]['members']}, broadcast=True)
+
+@socketio.on('remove_group_member')
+def handle_remove_group_member(data):
+    group_id = data['group_id']
+    member = data['member']
+    groups = load_json(GROUPS_FILE)
+    if group_id in groups and member in groups[group_id]['members']:
+        groups[group_id]['members'].remove(member)
+        save_json(GROUPS_FILE, groups)
+        users = load_json(USERS_FILE)
+        if member in users and group_id in users[member].get('groups', []):
+            users[member]['groups'].remove(group_id)
+        save_json(USERS_FILE, users)
+        emit('group_updated', {'group_id': group_id, 'members': groups[group_id]['members']}, broadcast=True)
+
+# ---------------------------------- Звонки (сигнализация) ----------------------------------
+@socketio.on('call_user')
+def handle_call(data):
+    from_user = data['from']
+    to_user = data['to']
+    # Сохраняем состояние звонка
+    calls = load_json(CALLS_FILE)
+    call_id = f"{from_user}_{to_user}_{datetime.now().timestamp()}"
+    calls[call_id] = {
+        'from': from_user,
+        'to': to_user,
+        'status': 'ringing',
+        'start_time': datetime.now().isoformat()
+    }
+    save_json(CALLS_FILE, calls)
+    emit('incoming_call', {'from': from_user, 'call_id': call_id}, room=to_user)
+
+@socketio.on('call_answer')
+def handle_call_answer(data):
     call_id = data['call_id']
+    answer = data['answer']  # True/False
+    calls = load_json(CALLS_FILE)
     if call_id in calls:
-        call = calls[call_id]
-        if call['callee'] == request.sid:
-            socketio.emit('call_rejected', {'call_id': call_id}, room=call['caller'])
-            del calls[call_id]
-            send_response(request.sid, {'status': 'ok'})
+        if answer:
+            calls[call_id]['status'] = 'active'
+            save_json(CALLS_FILE, calls)
+            emit('call_started', {'call_id': call_id, 'from': calls[call_id]['from']}, room=calls[call_id]['from'])
+            emit('call_started', {'call_id': call_id, 'to': calls[call_id]['to']}, room=calls[call_id]['to'])
         else:
-            send_response(request.sid, {'status': 'error', 'reason': 'Not callee'})
-    else:
-        send_response(request.sid, {'status': 'error', 'reason': 'Call not found'})
+            calls[call_id]['status'] = 'rejected'
+            save_json(CALLS_FILE, calls)
+            emit('call_rejected', {'call_id': call_id}, room=calls[call_id]['from'])
 
 @socketio.on('call_end')
 def handle_call_end(data):
     call_id = data['call_id']
+    calls = load_json(CALLS_FILE)
     if call_id in calls:
-        call = calls[call_id]
-        for room in (call['caller'], call['callee']):
-            if room:
-                socketio.emit('call_ended', {'call_id': call_id}, room=room)
-        del calls[call_id]
-        send_response(request.sid, {'status': 'ok'})
-    else:
-        send_response(request.sid, {'status': 'error', 'reason': 'Call not found'})
-
-@socketio.on('webrtc_signal')
-def handle_webrtc_signal(data):
-    call_id = data['call_id']
-    signal = data['signal']
-    if call_id in calls:
-        call = calls[call_id]
-        target_sid = call['callee'] if call['caller'] == request.sid else call['caller']
-        if target_sid:
-            socketio.emit('webrtc_signal', {'call_id': call_id, 'signal': signal}, room=target_sid)
-            send_response(request.sid, {'status': 'ok'})
-        else:
-            send_response(request.sid, {'status': 'error', 'reason': 'Target not found'})
-    else:
-        send_response(request.sid, {'status': 'error', 'reason': 'Call not found'})
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    # Удалить клиента из clients
-    for login, sid in list(clients.items()):
-        if sid == request.sid:
-            del clients[login]
-            break
-    # Удалить звонки с участием этого клиента
-    for cid, call in list(calls.items()):
-        if call['caller'] == request.sid or call['callee'] == request.sid:
-            other = call['callee'] if call['caller'] == request.sid else call['caller']
-            if other:
-                socketio.emit('call_ended', {'call_id': cid}, room=other)
-            del calls[cid]
-
-@app.route('/healthz')
-def healthz():
-    return 'OK', 200
+        calls[call_id]['status'] = 'ended'
+        save_json(CALLS_FILE, calls)
+        emit('call_ended', {'call_id': call_id}, room=calls[call_id]['from'])
+        emit('call_ended', {'call_id': call_id}, room=calls[call_id]['to'])
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    socketio.run(app, host='0.0.0.0', port=port)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
