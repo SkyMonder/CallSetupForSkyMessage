@@ -1,6 +1,5 @@
-# server.py
 from flask import Flask, request, jsonify
-from flask_socketio import SocketIO, emit, join_room
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import json
 import os
 import base64
@@ -17,11 +16,12 @@ GROUPS_FILE = os.path.join(DATA_DIR, 'groups.json')
 CHANNELS_FILE = os.path.join(DATA_DIR, 'channels.json')
 MESSAGES_FILE = os.path.join(DATA_DIR, 'messages.json')
 PROFILES_FILE = os.path.join(DATA_DIR, 'profiles.json')
+CALLS_FILE = os.path.join(DATA_DIR, 'calls.json')
 
 def init_data():
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
-    for file in [USERS_FILE, GROUPS_FILE, CHANNELS_FILE, MESSAGES_FILE, PROFILES_FILE]:
+    for file in [USERS_FILE, GROUPS_FILE, CHANNELS_FILE, MESSAGES_FILE, PROFILES_FILE, CALLS_FILE]:
         if not os.path.exists(file):
             with open(file, 'w', encoding='utf-8') as f:
                 json.dump({}, f)
@@ -94,7 +94,6 @@ def update_profile():
         profiles[login]['description'] = description
     if avatar is not None:
         profiles[login]['avatar'] = avatar
-        # также обновляем в users
         users = load_json(USERS_FILE)
         if login in users:
             users[login]['avatar'] = avatar
@@ -136,22 +135,21 @@ def save_message(chat_id, msg):
 def handle_private_message(data):
     from_user = data['from']
     to_user = data['to']
+    chat_id = f"private_{from_user}_{to_user}" if from_user < to_user else f"private_{to_user}_{from_user}"
     msg = {
         'id': str(uuid.uuid4()),
         'from': from_user,
         'text': data.get('text', ''),
         'timestamp': datetime.now().isoformat(),
         'type': 'private',
+        'chat_id': chat_id,
         'file': data.get('file'),
         'file_name': data.get('file_name'),
         'voice': data.get('voice')
     }
-    chat_id = f"private_{from_user}_{to_user}" if from_user < to_user else f"private_{to_user}_{from_user}"
     save_message(chat_id, msg)
-    # Добавляем в контакты
     add_contact(from_user, to_user)
     add_contact(to_user, from_user)
-    # Отправляем обоим
     emit('new_message', msg, room=from_user)
     emit('new_message', msg, room=to_user)
 
@@ -166,6 +164,7 @@ def handle_group_message(data):
         'timestamp': datetime.now().isoformat(),
         'type': 'group',
         'group_id': group_id,
+        'chat_id': group_id,
         'file': data.get('file'),
         'file_name': data.get('file_name')
     }
@@ -186,6 +185,7 @@ def handle_channel_message(data):
         'timestamp': datetime.now().isoformat(),
         'type': 'channel',
         'channel_id': channel_id,
+        'chat_id': channel_id,
         'file': data.get('file'),
         'file_name': data.get('file_name')
     }
@@ -236,7 +236,6 @@ def handle_create_group(data):
         'avatar': data.get('avatar')
     }
     save_json(GROUPS_FILE, groups)
-    # Добавляем группы в профили участников
     users = load_json(USERS_FILE)
     for member in groups[group_id]['members']:
         if member in users:
@@ -324,6 +323,59 @@ def get_messages(chat_id):
     messages = load_json(MESSAGES_FILE)
     return jsonify(messages.get(chat_id, []))
 
+# ---------------------------------- Звонки (сигнализация + аудио) ----------------------------------
+@socketio.on('call_user')
+def handle_call_user(data):
+    from_user = data['from']
+    to_user = data['to']
+    call_id = str(uuid.uuid4())
+    # Сохраняем состояние звонка
+    calls = load_json(CALLS_FILE)
+    calls[call_id] = {
+        'from': from_user,
+        'to': to_user,
+        'status': 'ringing',
+        'start_time': datetime.now().isoformat()
+    }
+    save_json(CALLS_FILE, calls)
+    emit('incoming_call', {'from': from_user, 'call_id': call_id}, room=to_user)
+
+@socketio.on('call_answer')
+def handle_call_answer(data):
+    call_id = data['call_id']
+    answer = data['answer']
+    calls = load_json(CALLS_FILE)
+    if call_id in calls:
+        if answer:
+            calls[call_id]['status'] = 'active'
+            save_json(CALLS_FILE, calls)
+            # Создаём комнату для аудиопотока
+            join_room(f"call_{call_id}")
+            emit('call_started', {'call_id': call_id}, room=calls[call_id]['from'])
+            emit('call_started', {'call_id': call_id}, room=calls[call_id]['to'])
+        else:
+            calls[call_id]['status'] = 'rejected'
+            save_json(CALLS_FILE, calls)
+            emit('call_rejected', {'call_id': call_id}, room=calls[call_id]['from'])
+
+@socketio.on('call_end')
+def handle_call_end(data):
+    call_id = data['call_id']
+    calls = load_json(CALLS_FILE)
+    if call_id in calls:
+        calls[call_id]['status'] = 'ended'
+        save_json(CALLS_FILE, calls)
+        leave_room(f"call_{call_id}")
+        emit('call_ended', {'call_id': call_id}, room=calls[call_id]['from'])
+        emit('call_ended', {'call_id': call_id}, room=calls[call_id]['to'])
+
+@socketio.on('call_audio')
+def handle_call_audio(data):
+    call_id = data['call_id']
+    audio = data['audio']  # base64 строка
+    # Пересылаем всем в комнате звонка, кроме отправителя
+    emit('call_audio', {'audio': audio}, room=f"call_{call_id}", skip_sid=request.sid)
+
 # ---------------------------------- Сокетные соединения ----------------------------------
 @socketio.on('connect')
 def handle_connect():
@@ -340,5 +392,4 @@ def handle_join(data):
     emit('joined', {'user': user}, room=user)
 
 if __name__ == '__main__':
-    # Для Render используем allow_unsafe_werkzeug=True
     socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
