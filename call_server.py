@@ -1,11 +1,11 @@
 # server.py
 from flask import Flask, request, jsonify
-from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_socketio import SocketIO, emit, join_room
 import json
 import os
 import base64
 from datetime import datetime
-import threading
+import uuid
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'skymessage_secret'
@@ -16,13 +16,12 @@ USERS_FILE = os.path.join(DATA_DIR, 'users.json')
 GROUPS_FILE = os.path.join(DATA_DIR, 'groups.json')
 CHANNELS_FILE = os.path.join(DATA_DIR, 'channels.json')
 MESSAGES_FILE = os.path.join(DATA_DIR, 'messages.json')
-CALLS_FILE = os.path.join(DATA_DIR, 'calls.json')
+PROFILES_FILE = os.path.join(DATA_DIR, 'profiles.json')
 
-# Создаём папку и файлы если их нет
 def init_data():
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
-    for file in [USERS_FILE, GROUPS_FILE, CHANNELS_FILE, MESSAGES_FILE, CALLS_FILE]:
+    for file in [USERS_FILE, GROUPS_FILE, CHANNELS_FILE, MESSAGES_FILE, PROFILES_FILE]:
         if not os.path.exists(file):
             with open(file, 'w', encoding='utf-8') as f:
                 json.dump({}, f)
@@ -43,7 +42,7 @@ def register():
     data = request.json
     login = data.get('login')
     password = data.get('password')
-    avatar = data.get('avatar')  # base64 строка
+    avatar = data.get('avatar')
 
     users = load_json(USERS_FILE)
     if login in users:
@@ -51,11 +50,17 @@ def register():
     users[login] = {
         'password': password,
         'avatar': avatar,
-        'contacts': [],
-        'groups': [],
-        'channels': []
+        'contacts': []  # логины, с которыми были сообщения
     }
     save_json(USERS_FILE, users)
+    
+    profiles = load_json(PROFILES_FILE)
+    profiles[login] = {
+        'description': '',
+        'avatar': avatar
+    }
+    save_json(PROFILES_FILE, profiles)
+    
     return jsonify({'success': True})
 
 @app.route('/login', methods=['POST'])
@@ -66,89 +71,106 @@ def login():
     users = load_json(USERS_FILE)
     if login not in users or users[login]['password'] != password:
         return jsonify({'success': False, 'error': 'Неверный логин или пароль'}), 401
-    return jsonify({'success': True, 'avatar': users[login].get('avatar')})
+    return jsonify({'success': True})
 
-# ---------------------------------- Получение данных ----------------------------------
-@app.route('/users/<login>')
-def get_user(login):
-    users = load_json(USERS_FILE)
-    if login not in users:
+# ---------------------------------- Профили ----------------------------------
+@app.route('/profile/<login>')
+def get_profile(login):
+    profiles = load_json(PROFILES_FILE)
+    if login not in profiles:
+        return jsonify({'error': 'Profile not found'}), 404
+    return jsonify(profiles[login])
+
+@app.route('/update_profile', methods=['POST'])
+def update_profile():
+    data = request.json
+    login = data.get('login')
+    description = data.get('description')
+    avatar = data.get('avatar')
+    profiles = load_json(PROFILES_FILE)
+    if login not in profiles:
         return jsonify({'error': 'User not found'}), 404
-    return jsonify({
-        'login': login,
-        'avatar': users[login].get('avatar')
-    })
+    if description is not None:
+        profiles[login]['description'] = description
+    if avatar is not None:
+        profiles[login]['avatar'] = avatar
+        # также обновляем в users
+        users = load_json(USERS_FILE)
+        if login in users:
+            users[login]['avatar'] = avatar
+            save_json(USERS_FILE, users)
+    save_json(PROFILES_FILE, profiles)
+    return jsonify({'success': True})
 
+# ---------------------------------- Поиск и контакты ----------------------------------
 @app.route('/search_users')
 def search_users():
     query = request.args.get('q', '')
     users = load_json(USERS_FILE)
-    result = [{'login': u, 'avatar': users[u].get('avatar')} for u in users if query.lower() in u.lower()]
+    result = [{'login': u} for u in users if query.lower() in u.lower()]
     return jsonify(result)
 
-@app.route('/groups')
-def get_groups():
-    groups = load_json(GROUPS_FILE)
-    return jsonify(groups)
+@app.route('/contacts/<login>')
+def get_contacts(login):
+    users = load_json(USERS_FILE)
+    if login not in users:
+        return jsonify([])
+    contacts = users[login].get('contacts', [])
+    return jsonify(contacts)
 
-@app.route('/channels')
-def get_channels():
-    channels = load_json(CHANNELS_FILE)
-    return jsonify(channels)
-
-# ---------------------------------- Сокетные события ----------------------------------
-@socketio.on('connect')
-def handle_connect():
-    print('Client connected')
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    print('Client disconnected')
-
-@socketio.on('join')
-def handle_join(data):
-    user = data['user']
-    join_room(user)
-    emit('joined', {'user': user}, room=user)
-
-@socketio.on('private_message')
-def handle_private_message(data):
-    to_user = data['to']
-    msg = {
-        'from': data['from'],
-        'text': data['text'],
-        'timestamp': datetime.now().isoformat(),
-        'type': 'private'
-    }
-    # Сохраняем сообщение
+# ---------------------------------- Сообщения ----------------------------------
+def save_message(chat_id, msg):
     messages = load_json(MESSAGES_FILE)
-    chat_id = f"private_{data['from']}_{to_user}" if data['from'] < to_user else f"private_{to_user}_{data['from']}"
     if chat_id not in messages:
         messages[chat_id] = []
     messages[chat_id].append(msg)
     save_json(MESSAGES_FILE, messages)
-    # Отправляем получателю
+
+def add_contact_if_needed(user, other):
+    users = load_json(USERS_FILE)
+    if user in users and other not in users[user].get('contacts', []):
+        users[user].setdefault('contacts', []).append(other)
+        save_json(USERS_FILE, users)
+
+@socketio.on('private_message')
+def handle_private_message(data):
+    to_user = data['to']
+    from_user = data['from']
+    msg = {
+        'id': str(uuid.uuid4()),
+        'from': from_user,
+        'text': data['text'],
+        'timestamp': datetime.now().isoformat(),
+        'type': 'private',
+        'file': data.get('file'),  # base64 или None
+        'file_name': data.get('file_name'),
+        'voice': data.get('voice')  # для голосовых
+    }
+    chat_id = f"private_{from_user}_{to_user}" if from_user < to_user else f"private_{to_user}_{from_user}"
+    save_message(chat_id, msg)
+    # Добавляем в контакты обоим
+    add_contact_if_needed(from_user, to_user)
+    add_contact_if_needed(to_user, from_user)
+    # Отправляем получателю и отправителю
     emit('new_message', msg, room=to_user)
-    # Отправителю для отображения
-    emit('new_message', msg, room=data['from'])
+    emit('new_message', msg, room=from_user)
 
 @socketio.on('group_message')
 def handle_group_message(data):
     group_id = data['group_id']
+    from_user = data['from']
     msg = {
-        'from': data['from'],
+        'id': str(uuid.uuid4()),
+        'from': from_user,
         'text': data['text'],
         'timestamp': datetime.now().isoformat(),
         'type': 'group',
-        'group_id': group_id
+        'group_id': group_id,
+        'file': data.get('file'),
+        'file_name': data.get('file_name'),
+        'voice': data.get('voice')
     }
-    # Сохраняем
-    messages = load_json(MESSAGES_FILE)
-    if group_id not in messages:
-        messages[group_id] = []
-    messages[group_id].append(msg)
-    save_json(MESSAGES_FILE, messages)
-    # Отправляем всем участникам группы
+    save_message(group_id, msg)
     groups = load_json(GROUPS_FILE)
     if group_id in groups:
         for member in groups[group_id]['members']:
@@ -157,79 +179,71 @@ def handle_group_message(data):
 @socketio.on('channel_message')
 def handle_channel_message(data):
     channel_id = data['channel_id']
+    from_user = data['from']
     msg = {
-        'from': data['from'],
+        'id': str(uuid.uuid4()),
+        'from': from_user,
         'text': data['text'],
         'timestamp': datetime.now().isoformat(),
         'type': 'channel',
-        'channel_id': channel_id
+        'channel_id': channel_id,
+        'file': data.get('file'),
+        'file_name': data.get('file_name')
     }
-    messages = load_json(MESSAGES_FILE)
-    if channel_id not in messages:
-        messages[channel_id] = []
-    messages[channel_id].append(msg)
-    save_json(MESSAGES_FILE, messages)
-    # Отправляем всем подписчикам канала
+    save_message(channel_id, msg)
     channels = load_json(CHANNELS_FILE)
     if channel_id in channels:
-        for member in channels[channel_id]['subscribers']:
-            emit('new_message', msg, room=member)
+        for subscriber in channels[channel_id]['subscribers']:
+            emit('new_message', msg, room=subscriber)
 
+@socketio.on('delete_message')
+def handle_delete_message(data):
+    msg_id = data['msg_id']
+    chat_id = data['chat_id']
+    messages = load_json(MESSAGES_FILE)
+    if chat_id in messages:
+        messages[chat_id] = [m for m in messages[chat_id] if m['id'] != msg_id]
+        save_json(MESSAGES_FILE, messages)
+        emit('message_deleted', {'msg_id': msg_id, 'chat_id': chat_id}, broadcast=True)
+
+@socketio.on('edit_message')
+def handle_edit_message(data):
+    msg_id = data['msg_id']
+    chat_id = data['chat_id']
+    new_text = data['new_text']
+    messages = load_json(MESSAGES_FILE)
+    if chat_id in messages:
+        for m in messages[chat_id]:
+            if m['id'] == msg_id:
+                m['text'] = new_text
+                m['edited'] = True
+                save_json(MESSAGES_FILE, messages)
+                emit('message_edited', {'msg_id': msg_id, 'chat_id': chat_id, 'new_text': new_text}, broadcast=True)
+                break
+
+# ---------------------------------- Группы ----------------------------------
 @socketio.on('create_group')
 def handle_create_group(data):
-    group_name = data['name']
+    name = data['name']
     creator = data['creator']
     members = data.get('members', [])
-    members.append(creator)  # создатель тоже участник
+    members.append(creator)
     groups = load_json(GROUPS_FILE)
-    group_id = f"group_{len(groups)+1}_{group_name}"
+    group_id = f"group_{len(groups)+1}_{name}"
     groups[group_id] = {
-        'name': group_name,
+        'name': name,
         'creator': creator,
         'members': list(set(members)),
         'avatar': data.get('avatar')
     }
     save_json(GROUPS_FILE, groups)
-    # Обновляем у пользователей список групп
+    # Добавляем группы в профили участников
     users = load_json(USERS_FILE)
     for member in groups[group_id]['members']:
         if member in users:
-            if group_id not in users[member].get('groups', []):
-                users[member].setdefault('groups', []).append(group_id)
+            users[member].setdefault('groups', []).append(group_id)
     save_json(USERS_FILE, users)
     emit('group_created', {'group_id': group_id, 'group': groups[group_id]}, broadcast=True)
-
-@socketio.on('create_channel')
-def handle_create_channel(data):
-    channel_name = data['name']
-    creator = data['creator']
-    channels = load_json(CHANNELS_FILE)
-    channel_id = f"channel_{len(channels)+1}_{channel_name}"
-    channels[channel_id] = {
-        'name': channel_name,
-        'creator': creator,
-        'subscribers': [creator],
-        'avatar': data.get('avatar')
-    }
-    save_json(CHANNELS_FILE, channels)
-    users = load_json(USERS_FILE)
-    if creator in users:
-        users[creator].setdefault('channels', []).append(channel_id)
-    save_json(USERS_FILE, users)
-    emit('channel_created', {'channel_id': channel_id, 'channel': channels[channel_id]}, broadcast=True)
-
-@socketio.on('join_channel')
-def handle_join_channel(data):
-    user = data['user']
-    channel_id = data['channel_id']
-    channels = load_json(CHANNELS_FILE)
-    if channel_id in channels and user not in channels[channel_id]['subscribers']:
-        channels[channel_id]['subscribers'].append(user)
-        save_json(CHANNELS_FILE, channels)
-        users = load_json(USERS_FILE)
-        users[user].setdefault('channels', []).append(channel_id)
-        save_json(USERS_FILE, users)
-        emit('channel_updated', {'channel_id': channel_id, 'subscribers': channels[channel_id]['subscribers']}, broadcast=True)
 
 @socketio.on('add_group_member')
 def handle_add_group_member(data):
@@ -259,49 +273,73 @@ def handle_remove_group_member(data):
         save_json(USERS_FILE, users)
         emit('group_updated', {'group_id': group_id, 'members': groups[group_id]['members']}, broadcast=True)
 
-# ---------------------------------- Звонки (сигнализация) ----------------------------------
-@socketio.on('call_user')
-def handle_call(data):
-    from_user = data['from']
-    to_user = data['to']
-    # Сохраняем состояние звонка
-    calls = load_json(CALLS_FILE)
-    call_id = f"{from_user}_{to_user}_{datetime.now().timestamp()}"
-    calls[call_id] = {
-        'from': from_user,
-        'to': to_user,
-        'status': 'ringing',
-        'start_time': datetime.now().isoformat()
+# ---------------------------------- Каналы ----------------------------------
+@socketio.on('create_channel')
+def handle_create_channel(data):
+    name = data['name']
+    creator = data['creator']
+    channels = load_json(CHANNELS_FILE)
+    channel_id = f"channel_{len(channels)+1}_{name}"
+    channels[channel_id] = {
+        'name': name,
+        'creator': creator,
+        'subscribers': [creator],
+        'avatar': data.get('avatar')
     }
-    save_json(CALLS_FILE, calls)
-    emit('incoming_call', {'from': from_user, 'call_id': call_id}, room=to_user)
+    save_json(CHANNELS_FILE, channels)
+    emit('channel_created', {'channel_id': channel_id, 'channel': channels[channel_id]}, broadcast=True)
 
-@socketio.on('call_answer')
-def handle_call_answer(data):
-    call_id = data['call_id']
-    answer = data['answer']  # True/False
-    calls = load_json(CALLS_FILE)
-    if call_id in calls:
-        if answer:
-            calls[call_id]['status'] = 'active'
-            save_json(CALLS_FILE, calls)
-            emit('call_started', {'call_id': call_id, 'from': calls[call_id]['from']}, room=calls[call_id]['from'])
-            emit('call_started', {'call_id': call_id, 'to': calls[call_id]['to']}, room=calls[call_id]['to'])
-        else:
-            calls[call_id]['status'] = 'rejected'
-            save_json(CALLS_FILE, calls)
-            emit('call_rejected', {'call_id': call_id}, room=calls[call_id]['from'])
+@socketio.on('subscribe_channel')
+def handle_subscribe_channel(data):
+    user = data['user']
+    channel_id = data['channel_id']
+    channels = load_json(CHANNELS_FILE)
+    if channel_id in channels and user not in channels[channel_id]['subscribers']:
+        channels[channel_id]['subscribers'].append(user)
+        save_json(CHANNELS_FILE, channels)
+        emit('channel_updated', {'channel_id': channel_id, 'subscribers': channels[channel_id]['subscribers']}, broadcast=True)
 
-@socketio.on('call_end')
-def handle_call_end(data):
-    call_id = data['call_id']
-    calls = load_json(CALLS_FILE)
-    if call_id in calls:
-        calls[call_id]['status'] = 'ended'
-        save_json(CALLS_FILE, calls)
-        emit('call_ended', {'call_id': call_id}, room=calls[call_id]['from'])
-        emit('call_ended', {'call_id': call_id}, room=calls[call_id]['to'])
+@socketio.on('unsubscribe_channel')
+def handle_unsubscribe_channel(data):
+    user = data['user']
+    channel_id = data['channel_id']
+    channels = load_json(CHANNELS_FILE)
+    if channel_id in channels and user in channels[channel_id]['subscribers']:
+        channels[channel_id]['subscribers'].remove(user)
+        save_json(CHANNELS_FILE, channels)
+        emit('channel_updated', {'channel_id': channel_id, 'subscribers': channels[channel_id]['subscribers']}, broadcast=True)
+
+# ---------------------------------- Получение данных ----------------------------------
+@app.route('/groups')
+def get_groups():
+    groups = load_json(GROUPS_FILE)
+    return jsonify(groups)
+
+@app.route('/channels')
+def get_channels():
+    channels = load_json(CHANNELS_FILE)
+    return jsonify(channels)
+
+@app.route('/messages/<chat_id>')
+def get_messages(chat_id):
+    messages = load_json(MESSAGES_FILE)
+    return jsonify(messages.get(chat_id, []))
+
+# ---------------------------------- Сокетные соединения ----------------------------------
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('join')
+def handle_join(data):
+    user = data['user']
+    join_room(user)
+    emit('joined', {'user': user}, room=user)
 
 if __name__ == '__main__':
-    # Для production на Render добавляем allow_unsafe_werkzeug=True
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
+    # Для Render используем allow_unsafe_werkzeug=True
+    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
